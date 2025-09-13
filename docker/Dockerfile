@@ -1,7 +1,7 @@
 FROM golang:1.22.6-bookworm AS builder
 
 WORKDIR /src
-COPY go.mod go.sum ./
+COPY go.* ./
 RUN go mod download
 
 COPY . .
