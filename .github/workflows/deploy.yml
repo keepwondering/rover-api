@@ -1,0 +1,133 @@
+name: deploy-api
+
+on:
+  push:
+    branches: [main, qa, dev]
+
+concurrency:
+  group: ${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # for Workload Identity Federation
+      contents: read
+
+    env:
+      # Will be set by the branch → env step
+      TF_DIR: infra/rover-api/envs/dev
+      TF_VARS: dev.tfvars
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Authoritative values from GitHub VARIABLES (not secrets):
+      # ROVER_GCP_PROJECT_ID, ROVER_GCP_REGION, ROVER_REPO_NAME (FULL AR path, e.g. us-central1-docker.pkg.dev/PROJECT/repo)
+      - name: Export GitHub Variables
+        run: |
+          {
+            echo "ROVER_GCP_PROJECT_ID=${{ vars.ROVER_GCP_PROJECT_ID }}"
+            echo "ROVER_REGION=${{ vars.ROVER_GCP_REGION }}"
+            echo "ROVER_REPO_NAME=${{ vars.ROVER_REPO_NAME }}"  # e.g. us-central1-docker.pkg.dev/homelab-470619/rover
+          } >> "$GITHUB_ENV"
+
+      # Branch → env mapping
+      - name: Select env (branch → TF_DIR/vars)
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            main) TF_DIR="infra/rover-api/envs/prod"; TF_VARS="prod.tfvars" ;;
+            qa)   TF_DIR="infra/rover-api/envs/qa";   TF_VARS="qa.tfvars"   ;;
+            *)    TF_DIR="infra/rover-api/envs/dev";  TF_VARS="dev.tfvars"  ;;
+          esac
+          echo "TF_DIR=$TF_DIR"   >> "$GITHUB_ENV"
+          echo "TF_VARS=$TF_VARS" >> "$GITHUB_ENV"
+          echo "Using $TF_DIR with $TF_VARS"
+
+      # Pull key fields from tfvars to name/tag the image correctly
+      - name: Load tfvars → env
+        env:
+          TFV: ${{ env.TF_DIR }}/${{ env.TF_VARS }}
+        run: |
+          kv () {
+            awk -v key="$1" -F= '
+              /^[[:space:]]*#/ {next}
+              /^[[:space:]]*$/ {next}
+              $1 ~ "^[[:space:]]*"key"[[:space:]]*$" {
+                val=$2
+                sub(/#.*/,"",val); sub(/\/\/.*/,"",val)
+                gsub(/^[[:space:]]+|[[:space:]]+$/,"",val)
+                gsub(/^"/,"",val); gsub(/"$/,"",val)
+                print val; exit
+              }' "$TFV"
+          }
+          SVC="$(kv service_name)"
+          if [ -z "$SVC" ]; then
+            echo "::error::service_name not found in $TFV"
+            exit 1
+          fi
+          echo "ROVER_SERVICE_NAME=$SVC" >> "$GITHUB_ENV"
+          echo "Service name: $SVC"
+
+      # Federated auth to GCP (no JSON key)
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.ROVER_GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.ROVER_GCP_SA_EMAIL }}
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.ROVER_GCP_PROJECT_ID }}
+
+      - name: Who am I (sanity)
+        run: |
+          gcloud auth list
+          gcloud config list project
+
+      # Docker auth to Artifact Registry
+      - name: Docker auth
+        run: gcloud auth configure-docker ${{ env.ROVER_REGION }}-docker.pkg.dev -q
+
+      # Build & push image from your Dockerfile (Go API)
+      - name: Build & push image
+        id: build
+        env:
+          REPO: ${{ env.ROVER_REPO_NAME }} # full AR path, e.g. us-central1-docker.pkg.dev/PROJECT/repo
+          SVC: ${{ env.ROVER_SERVICE_NAME }} # from tfvars
+        run: |
+          SHORT_SHA="${GITHUB_SHA::12}"
+          IMAGE="${REPO}/${SVC}:${SHORT_SHA}"
+
+          echo "Building $IMAGE"
+          DOCKER_BUILDKIT=1 docker build \
+            -f docker/Dockerfile \
+            -t "$IMAGE" .
+
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      # Terraform apply with dynamic image override
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -backend-config=backend.hcl
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_DIR }}
+        env:
+          TF_VAR_project_id: ${{ env.ROVER_GCP_PROJECT_ID }}
+          TF_VAR_region: ${{ env.ROVER_REGION }}
+          TF_VAR_image: ${{ steps.build.outputs.image }}
+        run: terraform apply -auto-approve -var-file=${{ env.TF_VARS }}
+
+      # (Optional) Show Cloud Run URL / DNS mapping
+      - name: Summary
+        if: always()
+        run: |
+          URL="$(terraform -chdir=${{ env.TF_DIR }} output -raw service_url || true)"
+          echo "Deployed image: ${{ steps.build.outputs.image }}"
+          echo "Service URL:    ${URL}"
